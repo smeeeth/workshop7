@@ -4,10 +4,6 @@ var express = require('express');
 var app = express();
 // Parses response bodies.
 var bodyParser = require('body-parser');
-//import mongodb
-var mongo_express = require('mongo-express/lib/middleware');
-// Import the default Mongo Express configuration
-var mongo_express_config = require('mongo-express/config.default.js');
 var database = require('./database');
 var readDocument = database.readDocument;
 var writeDocument = database.writeDocument;
@@ -16,41 +12,171 @@ var addDocument = database.addDocument;
 var getCollection = database.getCollection;
 var StatusUpdateSchema = require('./schemas/statusupdate.json');
 var CommentSchema = require('./schemas/comment.json');
+var mongo_express = require('mongo-express/lib/middleware');
+// Import the default Mongo Express configuration
+var mongo_express_config = require('mongo-express/config.default.js');
 var validate = require('express-jsonschema').validate;
+var MongoDB = require('mongodb');
+var MongoClient = MongoDB.MongoClient;
+var ObjectID = MongoDB.ObjectID;
+var url = 'mongodb://localhost:27017/facebook';
+MongoClient.connect(url, function(err, db) {
 
+app.use('/mongo_express', mongo_express(mongo_express_config));
 app.use(bodyParser.text());
 app.use(bodyParser.json());
 app.use(express.static('../client/build'));
-app.use('/mongo_express', mongo_express(mongo_express_config));
+
 /**
  * Resolves a feed item. Internal to the server, since it's synchronous.
  */
-function getFeedItemSync(feedItemId) {
-  var feedItem = readDocument('feedItems', feedItemId);
-  // Resolve 'like' counter.
-  feedItem.likeCounter = feedItem.likeCounter.map((id) => readDocument('users', id));
-  // Assuming a StatusUpdate. If we had other types of FeedItems in the DB, we would
-  // need to check the type and have logic for each type.
-  feedItem.contents.author = readDocument('users', feedItem.contents.author);
-  // Resolve comment author.
-  feedItem.comments.forEach((comment) => {
-    comment.author = readDocument('users', comment.author);
-  });
-  return feedItem;
+ /**
+  * Resolves a feed item. Internal to the server, since it's synchronous.
+  * @param feedItemId The feed item's ID. Must be an ObjectID.
+  * @param callback Called when the operation finishes. First argument is an error object,
+  *   which is null if the operation succeeds, and the second argument is the
+  *   resolved feed item.
+  */
+ function getFeedItem(feedItemId, callback) {
+   // Get the feed item with the given ID.
+   db.collection('feedItems').findOne({
+     _id: feedItemId
+   }, function(err, feedItem) {
+     if (err) {
+       // An error occurred.
+       return callback(err);
+     } else if (feedItem === null) {
+       // Feed item not found!
+       return callback(null, null);
+     }
+
+     // Build a list of all of the user objects we need to resolve.
+     // Start off with the author of the feedItem.
+     var userList = [feedItem.contents.author];
+     // Add all of the user IDs in the likeCounter.
+     userList = userList.concat(feedItem.likeCounter);
+     // Add all of the authors of the comments.
+     feedItem.comments.forEach((comment) => userList.push(comment.author));
+     // Resolve all of the user objects!
+     resolveUserObjects(userList, function(err, userMap) {
+       if (err) {
+         return callback(err);
+       }
+       // Use the userMap to look up the author's user object
+       feedItem.contents.author = userMap[feedItem.contents.author];
+       // Look up the user objects for all users in the like counter.
+       feedItem.likeCounter = feedItem.likeCounter.map((userId) => userMap[userId]);
+       // Look up each comment's author's user object.
+       feedItem.comments.forEach((comment) => {
+         comment.author = userMap[comment.author];
+       });
+       // Return the resolved feedItem!
+       callback(null, feedItem);
+     });
+   });
+ }
+
+/**
+ * Resolves a list of user objects. Returns an object that maps user IDs to
+ * user objects.
+ */
+function resolveUserObjects(userList, callback) {
+  // Special case: userList is empty.
+  // It would be invalid to query the database with a logical OR
+  // query with an empty array.
+  if (userList.length === 0) {
+    callback(null, {});
+  } else {
+    // Build up a MongoDB "OR" query to resolve all of the user objects
+    // in the userList.
+    var query = {
+      $or: userList.map((id) => { return {_id: id } })
+    };
+    // Resolve 'like' counter
+    db.collection('users').find(query).toArray(function(err, users) {
+      if (err) {
+        return callback(err);
+      }
+      // Build a map from ID to user object.
+      // (so userMap["4"] will give the user with ID 4)
+      var userMap = {};
+      users.forEach((user) => {
+        userMap[user._id] = user;
+      });
+      callback(null, userMap);
+    });
+  }
 }
 
 /**
  * Get the feed data for a particular user.
  */
-function getFeedData(user) {
-  var userData = readDocument('users', user);
-  var feedData = readDocument('feeds', userData.feed);
-  // While map takes a callback, it is synchronous, not asynchronous.
-  // It calls the callback immediately.
-  feedData.contents = feedData.contents.map(getFeedItemSync);
-  // Return FeedData with resolved references.
-  return feedData;
-}
+ /**
+  * Get the feed data for a particular user.
+  * @param user The ObjectID of the user document.
+  */
+ function getFeedData(user, callback) {
+   db.collection('users').findOne({
+     _id: user
+   }, function(err, userData) {
+     if (err) {
+       return callback(err);
+     } else if (userData === null) {
+       // User not found.
+       return callback(null, null);
+     }
+
+     db.collection('feeds').findOne({
+       _id: userData.feed
+     }, function(err, feedData) {
+       if (err) {
+         return callback(err);
+       } else if (feedData === null) {
+         // Feed not found.
+         return callback(null, null);
+       }
+
+       // We will place all of the resolved FeedItems here.
+       // When done, we will put them into the Feed object
+       // and send the Feed to the client.
+       var resolvedContents = [];
+
+       // processNextFeedItem is like an asynchronous for loop:
+       // It performs processing on one feed item, and then triggers
+       // processing the next item once the first one completes.
+       // When all of the feed items are processed, it completes
+       // a final action: Sending the response to the client.
+       function processNextFeedItem(i) {
+         // Asynchronously resolve a feed item.
+         getFeedItem(feedData.contents[i], function(err, feedItem) {
+           if (err) {
+             // Pass an error to the callback.
+             callback(err);
+           } else {
+             // Success!
+             resolvedContents.push(feedItem);
+             if (resolvedContents.length === feedData.contents.length) {
+               // I am the final feed item; all others are resolved.
+               // Pass the resolved feed document back to the callback.
+               feedData.contents = resolvedContents;
+               callback(null, feedData);
+             } else {
+               // Process the next feed item.
+               processNextFeedItem(i + 1);
+             }
+           }
+         });
+       }
+
+       // Special case: Feed is empty.
+       if (feedData.contents.length === 0) {
+         callback(null, feedData);
+       } else {
+         processNextFeedItem(0);
+       }
+     });
+   });
+ }
 
 /**
  * Get the user ID from a token. Returns -1 (an invalid ID) if it fails.
@@ -65,12 +191,13 @@ function getUserIdFromToken(authorizationLine) {
     var tokenObj = JSON.parse(regularString);
     var id = tokenObj['id'];
     // Check that id is a number.
-    if (typeof id === 'number') {
-      return id;
-    } else {
-      // Not a number. Return -1, an invalid ID.
-      return -1;
-    }
+    // Check that id is a string.
+if (typeof id === 'string') {
+  return id;
+} else {
+  // Not a number. Return "", an invalid ID.
+  return "";
+}
   } catch (e) {
     // Return an invalid ID.
     return -1;
@@ -80,19 +207,29 @@ function getUserIdFromToken(authorizationLine) {
 /**
  * Get the feed data for a particular user.
  */
-app.get('/user/:userid/feed', function(req, res) {
-  var userid = req.params.userid;
-  var fromUser = getUserIdFromToken(req.get('Authorization'));
-  // userid is a string. We need it to be a number.
-  var useridNumber = parseInt(userid, 10);
-  if (fromUser === useridNumber) {
-    // Send response.
-    res.send(getFeedData(userid));
-  } else {
-    // 403: Unauthorized request.
-    res.status(403).end();
-  }
-});
+ app.get('/user/:userid/feed', function(req, res) {
+   var userid = req.params.userid;
+   var fromUser = getUserIdFromToken(req.get('Authorization'));
+   if (fromUser === userid) {
+     // Convert userid into an ObjectID before passing it to database queries.
+     getFeedData(new ObjectID(userid), function(err, feedData) {
+       if (err) {
+         // A database error happened.
+         // Internal Error: 500.
+         res.status(500).send("Database error: " + err);
+       } else if (feedData === null) {
+         // Couldn't find the feed in the database.
+         res.status(400).send("Could not look up feed for user " + userid);
+       } else {
+         // Send data.
+         res.send(feedData);
+       }
+     });
+   } else {
+     // 403: Unauthorized request.
+     res.status(403).end();
+   }
+ });
 
 /**
  * Adds a new status update to the database.
@@ -379,4 +516,5 @@ app.use(function(err, req, res, next) {
 // Starts the server on port 3000!
 app.listen(3000, function () {
   console.log('Example app listening on port 3000!');
+});
 });
